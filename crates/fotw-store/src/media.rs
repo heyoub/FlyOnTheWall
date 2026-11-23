@@ -323,18 +323,22 @@ impl Db {
     ///
     /// Propagates SQLite failures.
     pub fn put_setting(&mut self, key: &str, value: &str) -> Result<()> {
-        let now = now_ms();
-        self.conn().execute(
-            "INSERT INTO settings (key, value, updated_at, lamport, origin_device_id)
+        put_setting_on(self.conn(), key, value)
+    }
+}
+
+pub(crate) fn put_setting_on(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at, lamport, origin_device_id)
              VALUES (?1, ?2, ?3, 0, ?4)
              ON CONFLICT (key) DO UPDATE SET
                  value = excluded.value,
                  updated_at = excluded.updated_at,
                  lamport = settings.lamport + 1",
-            params![key, value, now, self_device_id(self)],
-        )?;
-        Ok(())
-    }
+        params![key, value, now, self_device_id(conn)],
+    )?;
+    Ok(())
 }
 
 /// The device to stamp on rows this install writes.
@@ -342,15 +346,14 @@ impl Db {
 /// Reads `devices.is_self` when there is one and falls back to a literal
 /// rather than failing: a settings write must not be the thing that discovers
 /// the device table was never seeded.
-fn self_device_id(db: &Db) -> String {
-    db.conn()
-        .query_row("SELECT id FROM devices WHERE is_self = 1", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .optional()
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "local".to_owned())
+fn self_device_id(conn: &rusqlite::Connection) -> String {
+    conn.query_row("SELECT id FROM devices WHERE is_self = 1", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "local".to_owned())
 }
 
 /// §9.7 invariant 5, at the write.

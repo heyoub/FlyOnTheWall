@@ -345,6 +345,120 @@ pub async fn enrich_meeting_with(
     report
 }
 
+/// The results published by an explicit enrichment retry.
+pub struct RetryEnrichmentOutcome {
+    /// A newly generated title, if the prior title was eligible for replacement.
+    pub title: Option<String>,
+    /// The appended summary version.
+    pub summary_version: i64,
+    /// Warnings from the completed summary.
+    pub warnings: Vec<String>,
+}
+
+/// Retry title and summary generation for a saved meeting.
+pub async fn retry_enrichment(
+    db: &mut Db,
+    store: &dyn KeyStore,
+    meeting_id: &str,
+) -> Result<RetryEnrichmentOutcome, String> {
+    use crate::summarize::{prepare_summary, prepare_title};
+    use crate::summary_guard::{PolicyStamp, changed};
+
+    let describe = |error: SummarizeRunError| error.to_string();
+    let store_error = |error: fotw_store::StoreError| error.to_string();
+    let inputs = db
+        .setting_version(crate::engine::SETTINGS_KEY)
+        .and_then(|version| version.with_meeting_inputs(db, meeting_id))
+        .map_err(store_error)?;
+    let current = db.meetings().get(meeting_id).map_err(store_error)?.title;
+    let receipt_version = db.setting_version(RECEIPTS_KEY).map_err(store_error)?;
+    let previous = receipt_map(&receipt_version)?.remove(meeting_id);
+    let started_at_ms = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
+
+    let engine = match resolve_engine_detailed(store, db) {
+        EngineResolution::Engine(engine) => engine,
+        EngineResolution::NoneConfigured => return Err(SummarizeRunError::NoKey.to_string()),
+        EngineResolution::Unresolvable { configured } => {
+            return Err(format!(
+                "The configured summary engine is unavailable: {configured}"
+            ));
+        }
+    };
+    let stamp = PolicyStamp::capture(db, &engine, meeting_id).map_err(|e| e.to_string())?;
+    if stamp.version() != &inputs {
+        return Err(changed().to_string());
+    }
+
+    let set = TemplateSet::load_or_builtin(default_templates_dir()).map_err(|e| e.to_string())?;
+    let transport = std::sync::Arc::new(crate::transport::AllowlistedTransport::new());
+    // A prefix alone also matches titles chosen by the user. Require a
+    // matching receipt before replacing a saved title.
+    let title = if previous
+        .as_ref()
+        .is_some_and(|receipt| !receipt.minted_title.is_empty() && receipt.minted_title == current)
+    {
+        Some(
+            prepare_title(db, &engine, meeting_id, transport.clone(), &stamp)
+                .await
+                .map_err(describe)?,
+        )
+    } else {
+        None
+    };
+    let template = set
+        .for_event_title(title.as_deref().unwrap_or(&current))
+        .ok_or_else(|| "No summary templates are available.".to_owned())?;
+    let prepared = prepare_summary(db, &engine, meeting_id, template, transport, &stamp)
+        .await
+        .map_err(describe)?;
+    if prepared.extraction_failed {
+        return Err("Summary extraction failed. Enrichment was not saved.".to_owned());
+    }
+
+    // Reread after generation so a receipt written for another meeting during
+    // the run can be retained. Fence this final map read at publication.
+    let receipt_version = db.setting_version(RECEIPTS_KEY).map_err(store_error)?;
+    let mut receipts = receipt_map(&receipt_version)?;
+    if receipts.get(meeting_id) != previous.as_ref() {
+        return Err(changed().to_string());
+    }
+    let mut receipt = previous.unwrap_or_default();
+    receipt.started_at_ms = started_at_ms;
+    receipt.finished_at_ms = u64::try_from(fotw_store::now_ms()).unwrap_or(0);
+    if let Some(title) = &title {
+        receipt.minted_title.clone_from(title);
+    }
+    receipts.insert(meeting_id.to_owned(), receipt);
+    let json = serde_json::to_string(&receipts).map_err(|e| e.to_string())?;
+    let summary = db
+        .meetings()
+        .publish_enrichment_retry(
+            meeting_id,
+            prepared.summary,
+            stamp.version(),
+            title.as_deref(),
+            (&receipt_version, &json),
+        )
+        .map_err(store_error)?;
+
+    Ok(RetryEnrichmentOutcome {
+        title,
+        summary_version: summary.version,
+        warnings: prepared.warnings,
+    })
+}
+
+fn receipt_map(
+    snapshot: &fotw_store::SettingVersion,
+) -> Result<HashMap<String, EnrichReceipt>, String> {
+    snapshot
+        .value()
+        .map(serde_json::from_str)
+        .transpose()
+        .map(|map| map.unwrap_or_default())
+        .map_err(|_| "Existing enrichment receipts could not be read.".to_owned())
+}
+
 /// Ask the engine to name the meeting, and store the answer if it is a name.
 ///
 /// Every failure is a `problems` line and nothing more: the caller falls
