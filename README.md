@@ -217,6 +217,10 @@ Run a hosted engine command without the acknowledgement flag first to see its di
 
 Editing a meeting’s transcript, notes or title while generation is running prevents the older response from being saved. Retry generation to use the updated meeting.
 
+To repair a saved meeting, run `fotwd retry-enrichment <meeting-id> [dir]`. It retries the title when an earlier enrichment pass recorded it as generated and it still matches. Otherwise the command reports that it kept the existing title. A successful retry appends a summary version and clears the prior failure status. If generation or saving fails, the title and summary history stay as they were.
+
+Use `fotwd summarize <meeting-id> [dir] [--template <slug>]` when you want to regenerate just the summary.
+
 Changing destination fences queued jobs and future calls from an active job, cancels waiting for a response, and prevents old results from being published. A request already dispatched to a hosted service cannot be recalled. Off and Local-only do not inspect hosted keys. Local-only does not silently provision a model or fall back to cloud; it is a privacy gate pending the runtime/setup work, not a working local summary engine yet. For fully private meeting processing, transcription and export destinations must also be configured appropriately.
 
 ## Your Recovery Key

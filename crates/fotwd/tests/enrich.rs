@@ -1313,3 +1313,160 @@ async fn a_local_fallback_cannot_undo_a_rename_during_credential_resolution() {
     assert!(report.summary_version.is_none());
     assert!(report.problems.iter().any(|p| p.contains("changed")));
 }
+
+async fn retry_saved_enrichment(
+    db: &mut Db,
+    meeting: &str,
+) -> Result<(Option<String>, i64), String> {
+    let report = fotwd::enrich::retry_enrichment(db, &InMemoryKeyStore::new(), meeting).await?;
+    Ok((report.title, report.summary_version))
+}
+
+#[tokio::test]
+async fn explicit_retry_reports_a_preserved_title() {
+    let mut db = db();
+    let meeting = meeting_with_transcript(&mut db);
+    let title = "Untitled recording project planning";
+    db.meetings().set_title(&meeting, title).unwrap();
+    let cli = scripted_cli("retry-user-title", &[PROSE, EXTRACTION]);
+    cli_settings(&mut db, &cli.binary);
+
+    let (new_title, version) = retry_saved_enrichment(&mut db, &meeting).await.unwrap();
+    assert_eq!(new_title, None);
+    assert_eq!(version, 1);
+    assert_eq!(db.meetings().get(&meeting).unwrap().title, title);
+    assert_eq!(cli.invocations(), 2);
+}
+
+#[tokio::test]
+async fn explicit_retry_failure_preserves_title_summary_status_and_receipt() {
+    let mut db = db();
+    let meeting = meeting_with_transcript(&mut db);
+    let cli = scripted_cli(
+        "retry-failure",
+        &[
+            "Initial Planning",
+            PROSE,
+            EXTRACTION,
+            "Unpublished Planning",
+        ],
+    );
+    cli_settings(&mut db, &cli.binary);
+    let first = enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
+    assert_eq!(first.summary_version, Some(1));
+    let before = db.meetings().get(&meeting).unwrap();
+    let summary = db.meetings().current_summary(&meeting).unwrap().unwrap();
+    let receipt = db.get_setting(fotwd::enrich::RECEIPTS_KEY).unwrap();
+
+    assert!(retry_saved_enrichment(&mut db, &meeting).await.is_err());
+    assert_eq!(cli.invocations(), 5);
+    let after = db.meetings().get(&meeting).unwrap();
+    assert_eq!(after.title, before.title);
+    assert_eq!(after.lamport, before.lamport);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(after.enrich_status, before.enrich_status);
+    assert_eq!(after.enrich_detail, before.enrich_detail);
+    assert_eq!(
+        db.get_setting(fotwd::enrich::RECEIPTS_KEY).unwrap(),
+        receipt
+    );
+    let versions = db.meetings().summary_versions(&meeting).unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].id, summary.id);
+    assert!(versions[0].is_current);
+}
+
+#[tokio::test]
+async fn summarize_stays_summary_only() {
+    let mut db = db();
+    let meeting = meeting_with_transcript(&mut db);
+    let cli = scripted_cli("summary-only", &[PROSE, EXTRACTION]);
+    cli_settings(&mut db, &cli.binary);
+    let templates = TemplateSet::load_or_builtin(default_templates_dir()).unwrap();
+    let before = db.meetings().get(&meeting).unwrap();
+    let out = fotwd::summarize::summarize_meeting(
+        &mut db,
+        &InMemoryKeyStore::new(),
+        &meeting,
+        templates.get(FALLBACK_SLUG).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.version, 1);
+    assert_eq!(cli.invocations(), 2);
+    assert_eq!(db.meetings().get(&meeting).unwrap().title, before.title);
+    assert_eq!(db.get_setting(fotwd::enrich::RECEIPTS_KEY).unwrap(), None);
+}
+
+#[test]
+fn explicit_retry_is_a_recognized_command() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_fotwd"))
+        .arg("retry-enrichment")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "usage: fotwd retry-enrichment <meeting-id> [dir]\n"
+    );
+}
+
+#[tokio::test]
+async fn explicit_retry_rolls_back_when_the_receipt_cannot_be_saved() {
+    let mut db = db();
+    let meeting = meeting_with_transcript(&mut db);
+    let cli = scripted_cli(
+        "retry-write-failure",
+        &[
+            "Initial Planning",
+            PROSE,
+            EXTRACTION,
+            "Revised Planning",
+            PROSE,
+            EXTRACTION,
+        ],
+    );
+    cli_settings(&mut db, &cli.binary);
+    let first = enrich_meeting_with(&mut db, &InMemoryKeyStore::new(), &meeting).await;
+    assert_eq!(first.summary_version, Some(1));
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_receipt_update BEFORE UPDATE ON settings
+             WHEN NEW.key = 'enrich_receipts' BEGIN
+                 SELECT RAISE(ABORT, 'fixture rejected receipt');
+             END;",
+        )
+        .unwrap();
+
+    let error = retry_saved_enrichment(&mut db, &meeting).await.unwrap_err();
+    assert!(error.contains("fixture rejected receipt"), "{error}");
+    assert_eq!(cli.invocations(), 6);
+    assert_eq!(
+        db.meetings().get(&meeting).unwrap().title,
+        "Initial Planning"
+    );
+    let versions = db.meetings().summary_versions(&meeting).unwrap();
+    assert_eq!(versions.len(), 1);
+    assert!(versions[0].is_current);
+
+    db.conn()
+        .execute_batch("DROP TRIGGER reject_receipt_update")
+        .unwrap();
+    let retry = scripted_cli(
+        "retry-after-write-failure",
+        &["Revised Planning", PROSE, EXTRACTION],
+    );
+    cli_settings(&mut db, &retry.binary);
+    let (title, version) = retry_saved_enrichment(&mut db, &meeting).await.unwrap();
+    assert_eq!(title.as_deref(), Some("Revised Planning"));
+    assert_eq!(version, 2);
+    assert_eq!(
+        db.meetings().get(&meeting).unwrap().title,
+        "Revised Planning"
+    );
+    let versions = db.meetings().summary_versions(&meeting).unwrap();
+    assert_eq!(versions.len(), 2);
+    assert!(versions[0].is_current);
+    assert!(!versions[1].is_current);
+    assert_eq!(versions[1].version, 1);
+}

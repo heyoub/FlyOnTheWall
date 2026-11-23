@@ -83,6 +83,39 @@ impl MeetingRepo<'_> {
         self.insert_summary_checked(meeting_id, summary, Some(version))
     }
 
+    /// Publish a prepared enrichment retry as one library edit.
+    ///
+    /// The input and receipt observations must still be current. Passing no
+    /// title leaves the meeting's title and merge clock alone.
+    pub fn publish_enrichment_retry(
+        &mut self,
+        meeting_id: &str,
+        summary: NewSummary,
+        inputs: &crate::SettingVersion,
+        title: Option<&str>,
+        (receipt_version, receipt_json): (&crate::SettingVersion, &str),
+    ) -> Result<Summary> {
+        let tx = self
+            .db
+            .conn_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        inputs.ensure_for_meeting(&tx, meeting_id)?;
+        let summary = Self::append_summary(&tx, meeting_id, summary)?;
+        if let Some(title) = title {
+            tx.execute(
+                "UPDATE meetings SET title=?2,updated_at=?3,lamport=lamport+1 WHERE id=?1",
+                params![meeting_id, title, now_ms()],
+            )?;
+        }
+        tx.execute(
+            "UPDATE meetings SET enrich_status='ok',enrich_detail=NULL WHERE id=?1",
+            [meeting_id],
+        )?;
+        receipt_version.replace(&tx, receipt_json)?;
+        tx.commit()?;
+        Ok(summary)
+    }
+
     // ------------------------------------------------------------ meetings
 
     /// Insert a meeting and return its id.
@@ -260,7 +293,7 @@ impl MeetingRepo<'_> {
     /// `failed` is excluded. A meeting whose engine ran and errored would
     /// otherwise be retried on every pass, which is how an hourly sweeper burns
     /// a subscription in a loop against a usage limit that is not going away.
-    /// `fotwd summarize <id>` stays the manual retry for those.
+    /// `fotwd retry-enrichment <id>` is the manual repair for those.
     ///
     /// # Errors
     ///
@@ -589,14 +622,22 @@ impl MeetingRepo<'_> {
         s: NewSummary,
         version: Option<&crate::SettingVersion>,
     ) -> Result<Summary> {
-        let id = new_id();
-        let now = now_ms();
-
         let tx = self.db.conn_mut().transaction()?;
         if let Some(version) = version {
             version.ensure_for_meeting(&tx, meeting_id)?;
         }
+        let summary = Self::append_summary(&tx, meeting_id, s)?;
+        tx.commit()?;
+        Ok(summary)
+    }
 
+    fn append_summary(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_id: &str,
+        s: NewSummary,
+    ) -> Result<Summary> {
+        let id = new_id();
+        let now = now_ms();
         // Guard explicitly: a summary for a nonexistent meeting would
         // otherwise surface as an opaque FK violation.
         let exists: bool = tx
@@ -652,9 +693,7 @@ impl MeetingRepo<'_> {
         )?;
 
         let sql = format!("SELECT {} FROM summaries WHERE id = ?1", Summary::COLUMNS);
-        let out = tx.query_row(&sql, params![id], |r| Ok(Summary::from_row(r)))??;
-        tx.commit()?;
-        Ok(out)
+        tx.query_row(&sql, params![id], |r| Ok(Summary::from_row(r)))?
     }
 
     /// The summary the UI should show, if there is one.

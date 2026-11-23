@@ -160,6 +160,40 @@ where
     T: fotw_summarize::transport::HttpTransport + 'static,
 {
     let stamp = PolicyStamp::capture(db, engine, meeting_id)?;
+    let prepared = prepare_summary(db, engine, meeting_id, template, transport, &stamp).await?;
+    let summary =
+        db.meetings()
+            .insert_summary_if_setting(meeting_id, prepared.summary, stamp.version())?;
+    Ok(SummarizeOutcome {
+        version: summary.version,
+        markdown: summary.body_md,
+        coverage: prepared.coverage,
+        kept_items: prepared.kept_items,
+        dropped_items: prepared.dropped_items,
+        warnings: prepared.warnings,
+    })
+}
+
+pub(crate) struct PreparedSummary {
+    pub(crate) summary: NewSummary,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) extraction_failed: bool,
+    coverage: f64,
+    kept_items: usize,
+    dropped_items: usize,
+}
+
+pub(crate) async fn prepare_summary<T>(
+    db: &mut Db,
+    engine: &crate::engine::Engine,
+    meeting_id: &str,
+    template: &Template,
+    transport: Arc<T>,
+    stamp: &PolicyStamp,
+) -> Result<PreparedSummary, SummarizeRunError>
+where
+    T: fotw_summarize::transport::HttpTransport + 'static,
+{
     let Some(transcript_id) = crate::persist::primary_transcript_id(db, meeting_id) else {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));
     };
@@ -314,17 +348,13 @@ where
         &crate::documents::name_corrections(db, meeting_id),
     );
 
-    // Versioned, never overwritten. A user regenerating with a different
-    // template must be able to compare, and losing the previous version to do
-    // that would make the feature actively worse than not having it.
-    let summary = db.meetings().insert_summary_if_setting(
-        meeting_id,
-        NewSummary {
+    Ok(PreparedSummary {
+        summary: NewSummary {
             transcript_id: Some(transcript_id),
             provider: provider_name.to_owned(),
             model: recorded_model.clone(),
             prompt_hash: outcome.prompt_hash.clone(),
-            body_md: markdown.clone(),
+            body_md: markdown,
             coverage: Some(coverage),
             input_tokens: Some(
                 (outcome.usage_a.input_tokens + outcome.usage_b.input_tokens) as i64,
@@ -336,16 +366,14 @@ where
             template_id: None,
             origin_device_id: "local".to_owned(),
         },
-        stamp.version(),
-    )?;
-
-    Ok(SummarizeOutcome {
-        version: summary.version,
-        markdown,
         coverage,
         kept_items: outcome.validation.extraction.action_items.len(),
         dropped_items: outcome.validation.dropped.len(),
         warnings,
+        extraction_failed: outcome
+            .warnings
+            .iter()
+            .any(|w| matches!(w, Warning::ExtractionFailed { .. })),
     })
 }
 
@@ -484,6 +512,19 @@ where
     T: fotw_summarize::transport::HttpTransport + 'static,
 {
     let stamp = PolicyStamp::capture(db, engine, meeting_id)?;
+    prepare_title(db, engine, meeting_id, transport, &stamp).await
+}
+
+pub(crate) async fn prepare_title<T>(
+    db: &mut Db,
+    engine: &crate::engine::Engine,
+    meeting_id: &str,
+    transport: Arc<T>,
+    stamp: &PolicyStamp,
+) -> Result<String, SummarizeRunError>
+where
+    T: fotw_summarize::transport::HttpTransport + 'static,
+{
     let segments = stored_segments(db, meeting_id)?;
     if segments.is_empty() {
         return Err(SummarizeRunError::NoTranscript(meeting_id.to_owned()));

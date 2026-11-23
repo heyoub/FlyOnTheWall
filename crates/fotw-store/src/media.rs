@@ -316,7 +316,7 @@ impl Db {
     ///
     /// Propagates SQLite failures.
     pub fn put_setting(&mut self, key: &str, value: &str) -> Result<()> {
-        put_setting(self.conn(), key, value)
+        put_setting_on(self.conn(), key, value)
     }
 
     /// Update one setting from its current value under the SQLite writer lock.
@@ -337,7 +337,7 @@ impl Db {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = get_setting(&tx, key)?;
         if let Some(value) = update(current.as_deref())? {
-            put_setting(&tx, key, &value)?;
+            put_setting_on(&tx, key, &value)?;
         }
         tx.commit()?;
         Ok(())
@@ -354,7 +354,7 @@ fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
-fn put_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+pub(crate) fn put_setting_on(conn: &Connection, key: &str, value: &str) -> Result<()> {
     let now = now_ms();
     conn.execute(
         "INSERT INTO settings (key, value, updated_at, lamport, origin_device_id)

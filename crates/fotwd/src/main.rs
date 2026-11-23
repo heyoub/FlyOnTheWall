@@ -255,6 +255,18 @@ async fn run_cli(args: Vec<String>) -> ExitCode {
             let slug = flag_value(&args, "--template");
             summarize_command(root, id, slug).await
         }
+        Some("retry-enrichment") => {
+            let [_, id, rest @ ..] = args.as_slice() else {
+                eprintln!("usage: fotwd retry-enrichment <meeting-id> [dir]");
+                return ExitCode::FAILURE;
+            };
+            if rest.len() > 1 || args[1..].iter().any(|arg| arg.starts_with("--")) {
+                eprintln!("usage: fotwd retry-enrichment <meeting-id> [dir]");
+                return ExitCode::FAILURE;
+            }
+            let root = rest.first().map_or_else(default_root, PathBuf::from);
+            retry_enrichment_command(root, id).await
+        }
         Some("retitle-legacy") => {
             let pos = positionals(&args[1..], &[]);
             let root = pos.first().map_or_else(default_root, PathBuf::from);
@@ -303,7 +315,7 @@ async fn run_cli(args: Vec<String>) -> ExitCode {
         _ => {
             eprintln!(
                 "usage: fotwd <serve [dir] [--port <n>] | shell [dir] [--port <n>] | record [seconds] [dir] [--i-have-consent] | \
-                 list [dir] | summarize <id> [dir] [--template <slug>] | disclose | \
+                 list [dir] | summarize <id> [dir] [--template <slug>] | retry-enrichment <id> [dir] | disclose | \
                  onboard | detect [seconds] | \
                  retention [dir] [--apply] [--days <n>] [--budget-gib <n>] | \
                  key <set <provider>|list> | engine [off|local|anthropic|claude-cli|codex-cli] | \
@@ -2546,6 +2558,34 @@ async fn retitle_legacy_command(root: PathBuf, apply: bool) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+async fn retry_enrichment_command(root: PathBuf, meeting_id: &str) -> ExitCode {
+    let result = async {
+        let store = secrets::keystore().map_err(|e| format!("no OS keychain available: {e}"))?;
+        let mut db = open_db(&root)?;
+        fotwd::enrich::retry_enrichment(&mut db, store, meeting_id).await
+    }
+    .await;
+
+    match result {
+        Ok(report) => {
+            if let Some(title) = report.title {
+                println!("  title      : {title}");
+            } else {
+                println!("  title      : kept existing title");
+            }
+            println!("  version    : v{}", report.summary_version);
+            for warning in report.warnings {
+                println!("  warning    : {warning}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("fotwd: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

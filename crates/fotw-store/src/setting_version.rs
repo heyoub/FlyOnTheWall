@@ -78,6 +78,11 @@ impl SettingVersion {
         self.ensure_current(conn)
     }
 
+    pub(crate) fn replace(&self, conn: &Connection, value: &str) -> Result<()> {
+        self.ensure_current(conn)?;
+        crate::media::put_setting_on(conn, &self.key, value)
+    }
+
     pub(crate) fn ensure_current(&self, conn: &Connection) -> Result<()> {
         if self.matches(conn)? {
             Ok(())
