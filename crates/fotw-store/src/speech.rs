@@ -210,7 +210,13 @@ impl Db {
         let meeting_id = if let Some(ended) = ended_at_ms {
             crate::session_notes::finalize_in_transaction(&tx, session, meeting, ended, None)?
         } else {
-            crate::session_notes::retain_in_transaction(&tx, session, meeting, observed_elapsed)?
+            crate::session_notes::retain_in_transaction(
+                &tx,
+                session,
+                meeting,
+                observed_elapsed,
+                false,
+            )?
         };
         if sources.is_empty() {
             tx.commit()?;

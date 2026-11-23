@@ -191,6 +191,9 @@ pub struct Manifest {
     /// Absent until a clean finalize. Its absence is the recovery signal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at_ms: Option<u64>,
+    /// This finisher keeps the capture lease after WAL finalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finisher_holds_capture_lease: Option<bool>,
     /// Intervals that were not captured.
     #[serde(default)]
     pub gaps: Vec<Gap>,
@@ -521,6 +524,7 @@ impl SessionWal {
             system_format: Some(system),
             mic_format: mic,
             ended_at_ms: None,
+            finisher_holds_capture_lease: None,
             gaps: Vec::new(),
             encoded: None,
             claim: None,
@@ -628,7 +632,7 @@ impl SessionWal {
     ///
     /// After this the session is no longer offered for recovery.
     pub fn finalize(self) -> std::io::Result<PathBuf> {
-        self.finalize_keeping_lease().map(|(dir, _owner)| dir)
+        self.finalize_inner(false).map(|(dir, _owner)| dir)
     }
 
     /// [`finalize`](Self::finalize), handing back the capture lease instead
@@ -640,9 +644,17 @@ impl SessionWal {
     /// another process must not index it while its finisher is still alive.
     /// The lease covers only this session's directory.
     pub fn finalize_keeping_lease(
+        self,
+    ) -> std::io::Result<(PathBuf, crate::capture_clock::CaptureOwner)> {
+        self.finalize_inner(true)
+    }
+
+    fn finalize_inner(
         mut self,
+        keep_lease: bool,
     ) -> std::io::Result<(PathBuf, crate::capture_clock::CaptureOwner)> {
         self.flush()?;
+        self.manifest.finisher_holds_capture_lease = keep_lease.then_some(true);
         self.manifest.ended_at_ms = Some(now_ms());
         self.write_manifest()?;
         Ok((self.dir, self.capture_owner))
@@ -1054,13 +1066,12 @@ pub(crate) fn verify_encoded_track(
     file.sync_all()
 }
 
-/// Read a session's manifest.
+/// Read capture metadata independently of the transcript log.
 ///
-/// `pub(crate)` rather than private because [`crate::promote`] is the other
-/// half of this file's life cycle and has to read and rewrite the same
-/// document; duplicating the reader there would be two definitions of what a
-/// session directory is.
-pub(crate) fn read_manifest(dir: &Path) -> std::io::Result<Manifest> {
+/// # Errors
+///
+/// The manifest could not be opened, read, or deserialized.
+pub fn read_manifest(dir: &Path) -> std::io::Result<Manifest> {
     let mut s = String::new();
     File::open(dir.join("manifest.json"))?.read_to_string(&mut s)?;
     serde_json::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))

@@ -367,10 +367,9 @@ pub fn resume_promotions(db: &mut Db, data_root: &Path) -> Vec<Result<Promotion,
     let mut outcomes = Vec::new();
     for directory in pending {
         let result = (|| {
-            let state =
-                fotw_pipeline::wal::SessionState::read(&directory).map_err(|e| e.to_string())?;
-            let claim = state
-                .manifest
+            let manifest =
+                fotw_pipeline::wal::read_manifest(&directory).map_err(|e| e.to_string())?;
+            let claim = manifest
                 .claim
                 .ok_or_else(|| "capture has no meeting claim".to_owned())?;
             check_capture_alias(db, &directory, &claim.meeting_id)?;

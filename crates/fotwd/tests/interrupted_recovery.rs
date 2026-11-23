@@ -1307,13 +1307,12 @@ fn a_missing_canonical_tail_is_retained_without_blind_raw_reconstruction() {
     drop(f.wal.take());
     let before = std::fs::read(f.dir.join("system.stt16")).unwrap();
     startup(&owner(&f));
-    assert!(
-        Db::open(&f.database, &f.key)
-            .unwrap()
-            .session_note_meeting(&f.session)
-            .unwrap()
-            .is_none()
-    );
+    let mut db = Db::open(&f.database, &f.key).unwrap();
+    let id = db
+        .session_note_meeting(&f.session)
+        .unwrap()
+        .expect("visible interrupted recording");
+    assert_eq!(db.meetings().get(&id).unwrap().state, "interrupted");
     assert_eq!(std::fs::read(f.dir.join("system.stt16")).unwrap(), before);
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
     assert!(!f.dir.join("system.stt-sealed.json").exists());
@@ -1884,4 +1883,161 @@ fn finalized_capture_ownership_survives_cancelled_blocked_preparation() {
     }
     assert!(fotw_pipeline::capture_clock::CaptureOwner::recover(&dir).is_ok());
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn an_unreadable_log_is_kept_during_independent_journal_recovery() {
+    let mut f = fixture(true, 48000);
+    drop(f.wal.take());
+    let log = f.dir.join("stt.jsonl");
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    let evidence = log.join("original");
+    std::fs::write(&evidence, b"synthetic transcript evidence").unwrap();
+
+    startup(&owner(&f));
+
+    let db = Db::open(&f.database, &f.key).unwrap();
+    assert!(
+        db.session_note_meeting(&f.session).unwrap().is_some(),
+        "the unreadable legacy log blocked independent journal recovery"
+    );
+    assert_eq!(
+        std::fs::read(evidence).unwrap(),
+        b"synthetic transcript evidence"
+    );
+    assert!(f.dir.join("system.stt-sealed.json").exists());
+}
+
+#[test]
+fn index_only_status_does_not_parse_a_legacy_log_after_indexing() {
+    use fotw_web::speech_recovery::SpeechRecoveryControl;
+
+    let mut f = fixture(true, 16000);
+    drop(f.wal.take());
+    let recovery = owner(&f);
+    index(&recovery);
+    let db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    let clean = recovery.read(&id).unwrap();
+    let bytes =
+        br#"{"seq":0,"t0_ms":0,"t1_ms":100,"text":"synthetic words","audio_byte_offset":0}"#;
+    let path = f.dir.join("stt.jsonl");
+    std::fs::write(&path, bytes).unwrap();
+
+    assert!(!clean.can_retry);
+    assert_eq!(recovery.read(&id).unwrap(), clean);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn a_torn_legacy_log_does_not_hide_valid_journaled_speech() {
+    let mut f = fixture(true, 48000);
+    drop(f.wal.take());
+    let path = f.dir.join("stt.jsonl");
+    let torn = b"{\"seq\":0";
+    std::fs::write(&path, torn).unwrap();
+
+    startup(&owner(&f));
+
+    assert_eq!(std::fs::read(&path).unwrap(), torn);
+    let db = Db::open(&f.database, &f.key).unwrap();
+    assert!(
+        db.session_note_meeting(&f.session).unwrap().is_some(),
+        "the stopped capture and its independent journal disappeared from the library"
+    );
+    assert!(f.calls.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn an_indexed_journal_can_still_retry_after_its_legacy_log_is_torn() {
+    use fotw_web::speech_recovery::SpeechRecoveryControl;
+
+    let mut f = fixture(true, 48000);
+    drop(f.wal.take());
+    let recovery = owner(&f);
+    index(&recovery);
+    let db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    let path = f.dir.join("stt.jsonl");
+    let torn = b"{\"seq\":0";
+    std::fs::write(&path, torn).unwrap();
+
+    assert!(recovery.read(&id).unwrap().can_retry);
+    startup(&recovery);
+
+    assert!(f.calls.load(Ordering::SeqCst) > 0);
+    assert_eq!(std::fs::read(path).unwrap(), torn);
+}
+
+#[test]
+fn manual_recovery_and_status_accept_the_upstream_damaged_log_fixture() {
+    use fotw_web::speech_recovery::{RecoveryPhase, SpeechRecoveryControl};
+
+    let mut f = fixture(true, 48000);
+    drop(f.wal.take());
+    let recovery = owner(&f);
+    index(&recovery);
+    let db = Db::open(&f.database, &f.key).unwrap();
+    let id = db.session_note_meeting(&f.session).unwrap().unwrap();
+    let clean = recovery.read(&id).unwrap();
+    assert_eq!(clean.phase, RecoveryPhase::Incomplete);
+    assert!(clean.can_retry);
+
+    let path = f.dir.join("stt.jsonl");
+    let damaged = b"{\"seq\":0";
+    std::fs::write(&path, damaged).unwrap();
+
+    assert_eq!(recovery.read(&id).unwrap(), clean);
+    recovery
+        .retry(&id)
+        .expect("manual recovery accepts the independent journal");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let status = recovery.read(&id).unwrap();
+        if !status.worker_running {
+            assert_eq!(status.phase, RecoveryPhase::Complete);
+            break;
+        }
+        assert!(Instant::now() < deadline, "manual recovery did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(path).unwrap(), damaged);
+}
+
+#[test]
+fn successful_startup_indexing_does_not_rotate_diagnostics_for_an_unused_log() {
+    const CHILD: &str = "FOTW_TEST_QUIET_STARTUP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "successful_startup_indexing_does_not_rotate_diagnostics_for_an_unused_log",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let mut f = fixture(true, 48000);
+    drop(f.wal.take());
+    std::fs::remove_file(f.dir.join("stt.jsonl")).unwrap();
+    let journal = fotwd::journal::install(&f.root.path().join("sessions")).unwrap();
+    let full = vec![b'x'; fotwd::journal::DEFAULT_CAP_BYTES as usize];
+    std::fs::write(journal, &full).unwrap();
+    let recovery = owner(&f);
+
+    index(&recovery);
+    index(&recovery);
+
+    let db = Db::open(&f.database, &f.key).unwrap();
+    assert!(db.session_note_meeting(&f.session).unwrap().is_some());
+    assert_eq!(std::fs::metadata(journal).unwrap().len(), full.len() as u64);
+    assert_eq!(std::fs::read(journal).unwrap(), full);
 }

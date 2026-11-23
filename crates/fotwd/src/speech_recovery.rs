@@ -259,6 +259,9 @@ impl SavedSpeechRecovery {
             let Some(session) = session.to_str() else {
                 continue;
             };
+            if session.ends_with(fotw_pipeline::promote::RETIRED_SUFFIX) {
+                continue;
+            }
             let lookup = {
                 let db = self.db();
                 db.capture_session_was_deleted(session).and_then(|deleted| {
@@ -294,7 +297,9 @@ impl SavedSpeechRecovery {
                         .db()
                         .session_note_meeting(&capture.session)
                         .is_ok_and(|id| id.is_none());
-                    let projected = if capture.ended.is_some() {
+                    let projected = if let Some(log) = &capture.index_only_log {
+                        crate::persist::index_retained_log(&mut self.db(), &capture, log)
+                    } else if capture.ended.is_some() {
                         crate::persist::persist_session(
                             &mut self.db(),
                             &outcome,
@@ -327,7 +332,12 @@ impl SavedSpeechRecovery {
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => needs_reconciliation = true,
+                Err(error) => {
+                    crate::journal::record(&format!(
+                        "speech recovery: capture {session} kept on disk: {error}"
+                    ));
+                    needs_reconciliation = true;
+                }
             }
         }
         if projection_failed {
@@ -445,9 +455,9 @@ impl SavedSpeechRecovery {
         if !regular(&dir.join("manifest.json")) {
             return Err(RecoveryError::Invalid);
         }
-        let wal =
-            fotw_pipeline::wal::SessionState::read(&dir).map_err(|_| RecoveryError::Invalid)?;
-        if wal.manifest.id != session || wal.manifest.started_at_ms != started as u64 {
+        let manifest =
+            fotw_pipeline::wal::read_manifest(&dir).map_err(|_| RecoveryError::Invalid)?;
+        if manifest.id != session || manifest.started_at_ms != started as u64 {
             return Err(RecoveryError::Invalid);
         }
         // An unfinished WAL must prove the original Stop. Saved finalized clocks
@@ -471,7 +481,7 @@ impl SavedSpeechRecovery {
                     )?,
                 )
             }
-        } else if wal.is_finalized() {
+        } else if manifest.ended_at_ms.is_some() {
             if held_capture.is_some() {
                 None
             } else {
@@ -514,6 +524,13 @@ impl SavedSpeechRecovery {
                 })?,
             )
         };
+        let index_only = if let Some(owner) = capture_owner.as_ref().or(held_capture)
+            && !clock_is_final
+        {
+            crate::interrupted_capture::index_only_stop(&dir, owner).unwrap_or(false)
+        } else {
+            false
+        };
         let mut sources = Vec::new();
         let mut status = initial(if clock_is_final {
             RecoveryPhase::Complete
@@ -524,10 +541,16 @@ impl SavedSpeechRecovery {
             status.can_retry = false;
             status.message=Some("Recording interrupted. The final recording time is unknown. Your audio, notes and any saved transcript are retained.".into());
         }
-        for (source, replay, name) in [
+        if index_only {
+            status.message = Some(
+                "Recording interrupted. The original audio and transcript log remain in the session folder. Recovery could not confirm a completed save.".into(),
+            );
+        }
+        let legs = [
             (Source::System, ReplaySource::System, "system"),
             (Source::Mic, ReplaySource::Mic, "mic"),
-        ] {
+        ];
+        for (source, replay, name) in legs.into_iter().filter(|_| !index_only) {
             let journal = dir.join(format!("{name}.stt-coverage.jsonl"));
             if !journal.try_exists().map_err(|_| RecoveryError::Invalid)? {
                 continue;

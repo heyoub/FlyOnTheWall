@@ -286,6 +286,42 @@ pub fn refresh_speech_projection(
     Ok(())
 }
 
+/// Index the intact legacy log alongside the retained recording.
+pub(crate) fn index_retained_log(
+    db: &mut Db,
+    capture: &crate::interrupted_capture::StoppedCapture,
+    log: &[fotw_pipeline::wal::SttRecord],
+) -> StoreResult<String> {
+    let integer = |value| {
+        i64::try_from(value).map_err(|_| {
+            fotw_store::StoreError::InvalidArgument("capture time exceeds storage range".into())
+        })
+    };
+    let mut meeting = NewMeeting::new(device_id(), timezone());
+    meeting.title = "Interrupted recording".into();
+    meeting.started_at_ms = integer(capture.started)?;
+    let rows = log
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let mut row = NewSegment::new(
+                integer(index as u64)?,
+                integer(record.t0_ms)?,
+                integer(record.t1_ms)?,
+                record.text.clone(),
+            );
+            row.channel = "system".into();
+            Ok(row)
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    db.index_retained_capture(
+        &capture.session,
+        meeting,
+        integer(capture.observed_elapsed)?,
+        &rows,
+    )
+}
+
 /// Index retained audio without a final clock, input seal or completion ack.
 pub(crate) fn persist_interrupted(
     db: &mut Db,
