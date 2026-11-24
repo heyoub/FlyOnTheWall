@@ -30,6 +30,7 @@ This branch indexes work in progress on this fork for nolanmak/FlyOnTheWall, and
 | --- | --- | --- | --- | --- |
 | `wip/enrichment-retry` | Adds an explicit retry for saved meeting enrichment. | part of #96 | Full project CI passed locally on this commit (Linux; `just ci`, incremental compilation and debug info turned off): 2,577 passed, 0 failed, 7 ignored. Independent review returned it for rework. | Review found, with failing tests: a title the user changed and then set back to the generated text can be replaced; transcript segments are selected by transcript only, so a library imported from a damaged archive could feed another meeting's text into the summary; an empty engine response can be saved as a successful summary; a retry that overlaps the background enrichment pass can report success and then be marked failed. Being reworked; do not use as-is. |
 | `wip/recovery-rows-and-lease` | Two commits: validate and write playback rows before a session folder is archived; hold the capture lease until the live save completes and, when a meeting already exists for the session, report it and keep the source. | none filed yet | Full project CI passed locally on both commits (Linux; `just ci`, incremental compilation and debug info turned off); independently reviewed; not yet proposed upstream. | The dashboard can still say Saved after such a collision (inherited). |
+| `wip/recover-stopped-recordings` | Three commits: write playback rows before a session folder is archived; hold the capture lease until the live save completes; at start-up, list a recording that was stopped but never saved as an interrupted meeting, keeping its audio and transcript log in place. Adds nothing that deletes or overwrites user content. | none filed yet | Full project CI passed locally on each of the three commits (Linux; `just ci`, incremental compilation and debug info turned off); independently reviewed twice; not yet proposed upstream. | Background archiving of such recordings, a finish-status report and a quit command were deliberately left out; a recording listed this way keeps its raw session folder until archived by existing means; one upstream test's expectation changes (a session upstream left invisible is listed as interrupted), which is a design question for the maintainer. |
 
 ## Integration
 
@@ -39,7 +40,6 @@ This branch indexes work in progress on this fork for nolanmak/FlyOnTheWall, and
 
 - No meeting for an empty failed start (#271), being reworked after review found two gaps.
 - Imported-title sweep (part of #96), being reworked after review.
-- Recovery of recordings that were stopped and then interrupted mid-save, being redesigned so that nothing it adds can delete user content.
 - Native Windows support, awaiting final qualification.
 
 ## Design questions for the maintainer (drafts in preparation)
