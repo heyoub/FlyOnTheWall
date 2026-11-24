@@ -295,3 +295,53 @@ fn incremental_gaps_coalesce_without_merging_sources_or_disjoint_outages() {
     drop(wal);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn session_state_and_status_scan_keep_valid_records_around_a_malformed_line() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = SessionWal::create(root.path(), 16000, 1).unwrap();
+    let dir = wal.dir().to_owned();
+    drop(wal);
+    let bytes = concat!(
+        r#"{"seq":0,"t0_ms":0,"t1_ms":1,"text":"first","audio_byte_offset":0}"#,
+        "\n{malformed}\n",
+        r#"{"seq":1,"t0_ms":10,"t1_ms":9,"text":"last","audio_byte_offset":0,"future_field":true}"#,
+    )
+    .as_bytes();
+    let path = dir.join("stt.jsonl");
+    std::fs::write(&path, bytes).unwrap();
+
+    let state = SessionState::read(&dir).unwrap();
+    assert_eq!(
+        state
+            .stt
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "last"]
+    );
+    let scanned = recover(root.path()).unwrap();
+    assert_eq!(scanned.len(), 1);
+    assert_eq!(scanned[0].stt, state.stt);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+    std::fs::write(&path, [bytes, b"\xff"].concat()).unwrap();
+    assert!(SessionState::read(&dir).unwrap().stt.is_empty());
+    assert!(recover(root.path()).unwrap()[0].stt.is_empty());
+}
+
+#[test]
+fn session_state_and_status_scan_still_read_logs_above_the_import_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = SessionWal::create(root.path(), 16000, 1).unwrap();
+    let dir = wal.dir().to_owned();
+    drop(wal);
+    let record = format!(
+        "{{\"seq\":0,\"t0_ms\":0,\"t1_ms\":1,\"text\":\"{}\",\"audio_byte_offset\":0}}\n",
+        "x".repeat(512 * 1024)
+    );
+    std::fs::write(dir.join("stt.jsonl"), record.repeat(17)).unwrap();
+
+    assert_eq!(SessionState::read(&dir).unwrap().stt.len(), 17);
+    assert_eq!(recover(root.path()).unwrap()[0].stt.len(), 17);
+}

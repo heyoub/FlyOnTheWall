@@ -68,6 +68,45 @@ impl Db {
         Ok(id)
     }
 
+    /// Save a live capture only if no meeting is already linked to it.
+    pub fn finalize_new_capture(
+        &mut self,
+        session: &str,
+        meeting: crate::NewMeeting,
+        ended_at_ms: i64,
+        transcript: Option<(&str, &str, &[crate::NewSegment])>,
+    ) -> Result<String> {
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_unlinked(&tx, session)?;
+        let id = finalize_in_transaction(&tx, session, meeting, ended_at_ms, transcript)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Index retained audio and its intact legacy log in one transaction.
+    pub fn index_retained_capture(
+        &mut self,
+        session: &str,
+        meeting: crate::NewMeeting,
+        observed_elapsed_ms: i64,
+        segments: &[crate::NewSegment],
+    ) -> Result<String> {
+        let tx = self
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_unlinked(&tx, session)?;
+        let id = retain_in_transaction(&tx, session, meeting, observed_elapsed_ms, true)?;
+        if !segments.is_empty() {
+            let transcript =
+                crate::repo::insert_transcript(&tx, &id, "session-log", "retained log", true)?;
+            crate::repo::insert_segments(&tx, &transcript, segments)?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// Atomically attach a session's notes to its saved meeting, preserving revisions.
     pub fn promote_session_note(
         &mut self,
@@ -83,7 +122,7 @@ impl Db {
         let tx = self
             .conn_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        promote_in_transaction(&tx, session, meeting, started_at_ms, elapsed_ms)?;
+        promote_in_transaction(&tx, session, meeting, started_at_ms, elapsed_ms, false)?;
         tx.commit()?;
         Ok(())
     }
@@ -262,6 +301,7 @@ pub(crate) fn retain_in_transaction(
     session: &str,
     mut meeting: crate::NewMeeting,
     observed_elapsed: i64,
+    keep_draft: bool,
 ) -> Result<String> {
     validate_session(session)?;
     let started = meeting.started_at_ms;
@@ -291,7 +331,7 @@ pub(crate) fn retain_in_transaction(
     }
     meeting.state = "interrupted".into();
     let id = crate::repo::insert_meeting(tx, meeting)?;
-    promote_in_transaction(tx, session, &id, started, elapsed)?;
+    promote_in_transaction(tx, session, &id, started, elapsed, keep_draft)?;
     tx.execute(
         "UPDATE session_note_links SET clock_is_final=0 WHERE session_id=?1",
         [session],
@@ -305,6 +345,7 @@ fn promote_in_transaction(
     meeting: &str,
     started_at_ms: i64,
     elapsed_ms: i64,
+    keep_draft: bool,
 ) -> Result<()> {
     ensure_capture_not_deleted(tx, session)?;
     if let Some(link) = read_link(tx, session)? {
@@ -340,7 +381,9 @@ fn promote_in_transaction(
     }
     tx.execute("INSERT INTO session_note_links(session_id,meeting_id,started_at_ms,elapsed_ms) VALUES(?1,?2,?3,?4)",
             params![session,meeting,started_at_ms,elapsed_ms])?;
-    tx.execute("DELETE FROM session_notes WHERE session_id=?1", [session])?;
+    if !keep_draft {
+        tx.execute("DELETE FROM session_notes WHERE session_id=?1", [session])?;
+    }
     Ok(())
 }
 
@@ -371,6 +414,15 @@ pub(crate) fn deleted_capture_sessions(
         }
     }
     Ok(sessions)
+}
+
+pub(crate) fn ensure_unlinked(conn: &rusqlite::Connection, session: &str) -> Result<()> {
+    if read_link(conn, session)?.is_some() {
+        return Err(invalid(
+            "capture already has a saved meeting; session files retained",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_capture_not_deleted(conn: &rusqlite::Connection, session: &str) -> Result<()> {
@@ -436,6 +488,6 @@ pub(crate) fn finalize_in_transaction(
         "UPDATE meetings SET ended_at_ms=?2,duration_ms=?3 WHERE id=?1",
         params![id, ended_at_ms, elapsed],
     )?;
-    promote_in_transaction(tx, session, &id, started, elapsed)?;
+    promote_in_transaction(tx, session, &id, started, elapsed, false)?;
     Ok(id)
 }

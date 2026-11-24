@@ -9,6 +9,7 @@ use crate::failover::coverage::CoverageJournal;
 use fotw_pipeline::{
     capture_clock::{CaptureOwner, CaptureSnapshot},
     replay::{ReplayReader, ReplaySource, ReplayWriter},
+    wal::SttRecord,
 };
 use fotw_stt::Source;
 use std::{
@@ -23,6 +24,7 @@ pub(crate) struct StoppedCapture {
     pub started: u64,
     pub ended: Option<u64>,
     pub observed_elapsed: u64,
+    pub index_only_log: Option<Vec<SttRecord>>,
     // Hold every lease until the database projection has returned.
     _audio: Vec<ReplayWriter>,
     _journals: Vec<CoverageJournal>,
@@ -140,6 +142,31 @@ pub(crate) fn reconstruct_saved(dir: &Path, stop: &AtomicBool) -> io::Result<()>
     let (_owner, proof) = snapshot(dir)?;
     crate::raw_replay::repair(dir, &proof, stop)
 }
+#[derive(Debug, thiserror::Error)]
+#[error("stopped capture needs canonical audio reconciliation")]
+struct CanonicalMismatch;
+
+fn canonical_mismatch() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, CanonicalMismatch)
+}
+
+pub(crate) fn index_only_stop(dir: &Path, owner: &CaptureOwner) -> io::Result<bool> {
+    let proof = owner.snapshot()?;
+    if proof.frozen_capture_clock().is_none() {
+        return Ok(false);
+    }
+    match boundaries(dir, &proof) {
+        Ok(bounds) => Ok(bounds.is_empty()),
+        Err(e)
+            if e.get_ref()
+                .is_some_and(|cause| cause.is::<CanonicalMismatch>()) =>
+        {
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn boundaries(dir: &Path, proof: &CaptureSnapshot) -> io::Result<Vec<Boundary>> {
     let clock_end = proof
         .checkpoint
@@ -167,7 +194,7 @@ fn boundaries(dir: &Path, proof: &CaptureSnapshot) -> io::Result<Vec<Boundary>> 
         // A recorded leg need not have been configured for transcription.
         if !present(&journal)? {
             if present(&dir.join(format!("{name}.stt16")))? {
-                return Err(invalid("canonical input has no coverage identity"));
+                return Err(canonical_mismatch());
             }
             continue;
         }
@@ -202,7 +229,7 @@ fn boundaries(dir: &Path, proof: &CaptureSnapshot) -> io::Result<Vec<Boundary>> 
             .checked_add(raw_samples)
             .ok_or_else(|| invalid("capture sample clock overflow"))?;
         if end > clock_end || reader.saved_end()? != end {
-            return Err(invalid("canonical/raw duration reconciliation is required"));
+            return Err(canonical_mismatch());
         }
         reader.sealed_end()?;
         let saved = CoverageJournal::snapshot(dir, &proof.checkpoint.session_id, source)?;
@@ -222,6 +249,85 @@ fn boundaries(dir: &Path, proof: &CaptureSnapshot) -> io::Result<Vec<Boundary>> 
     Ok(out)
 }
 
+// Include the terminator in both limits. Bound the read itself in case a file
+// grows after the metadata check.
+const MAX_STT_RECORD_BYTES: usize = 128 * 1024;
+const MAX_STT_LOG_BYTES: usize = 8 * 1024 * 1024;
+
+// Keep this schema check private to fallback admission. The general WAL
+// reader still deserializes its original, permissive record type.
+#[derive(serde::Deserialize)]
+#[serde(remote = "SttRecord", deny_unknown_fields)]
+struct FallbackRecord {
+    seq: u64,
+    t0_ms: u64,
+    t1_ms: u64,
+    text: String,
+    audio_byte_offset: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct StrictLogRecord(#[serde(with = "FallbackRecord")] SttRecord);
+
+fn read_fallback_log(dir: &Path) -> io::Result<Vec<SttRecord>> {
+    use std::io::{BufRead, BufReader, Error, ErrorKind, Read};
+
+    let path = dir.join("stt.jsonl");
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "transcript log is not an ordinary file",
+        ));
+    }
+    let oversized = || Error::new(ErrorKind::InvalidData, "transcript log exceeds 8 MiB");
+    if metadata.len() > MAX_STT_LOG_BYTES as u64 {
+        return Err(oversized());
+    }
+
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut line = Vec::new();
+    let mut records = Vec::new();
+    let mut remaining = MAX_STT_LOG_BYTES;
+    let mut line_number = 0;
+    loop {
+        line_number += 1;
+        line.clear();
+        let limit = remaining.min(MAX_STT_RECORD_BYTES) + 1;
+        let length = reader
+            .by_ref()
+            .take(limit as u64)
+            .read_until(b'\n', &mut line)?;
+        if length == 0 {
+            return Ok(records);
+        }
+        if length > remaining {
+            return Err(oversized());
+        }
+        remaining -= length;
+        let error = |reason: &str| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("transcript log line {line_number}: {reason}"),
+            )
+        };
+        if length > MAX_STT_RECORD_BYTES {
+            return Err(error("record exceeds 128 KiB"));
+        }
+        if line.last() != Some(&b'\n') {
+            return Err(error("missing record terminator"));
+        }
+        let text = std::str::from_utf8(&line).map_err(|_| error("invalid UTF-8"))?;
+        let StrictLogRecord(record) =
+            serde_json::from_str(text).map_err(|_| error("invalid record"))?;
+        if record.t1_ms < record.t0_ms {
+            return Err(error("end precedes start"));
+        }
+        records.push(record);
+    }
+}
+
 /// Freeze existing canonical input under all leases before projecting a stopped WAL.
 /// Reconcile eligible mapped suffixes before admission. This never stamps a
 /// clean manifest or guesses a capture end.
@@ -239,15 +345,53 @@ pub(crate) fn prepare(dir: &Path, stop: &AtomicBool) -> io::Result<Option<Stoppe
             started: proof.checkpoint.started_at_ms,
             ended: None,
             observed_elapsed: proof.checkpoint.elapsed_ms,
+            index_only_log: None,
             _audio: vec![],
             _journals: vec![],
             _retained: retained,
             _capture: owner,
         }));
     };
-    let bounds = boundaries(dir, &proof)?;
+    let bounds = match boundaries(dir, &proof) {
+        Err(e)
+            if e.get_ref()
+                .is_some_and(|cause| cause.is::<CanonicalMismatch>()) =>
+        {
+            Vec::new()
+        }
+        result => result?,
+    };
     if bounds.is_empty() {
-        return Err(invalid("interrupted capture has no canonical source plan"));
+        let manifest = fotw_pipeline::wal::read_manifest(dir)?;
+        if manifest.claim.is_some() {
+            return Ok(None);
+        }
+        if manifest.ended_at_ms.is_some() && manifest.finisher_holds_capture_lease != Some(true) {
+            return Err(invalid(
+                "finisher ownership is unknown for this older capture",
+            ));
+        }
+        if stop.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let log = read_fallback_log(dir).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not validate transcript log: {error}"),
+            )
+        })?;
+        return Ok(Some(StoppedCapture {
+            dir: dir.to_owned(),
+            session: proof.checkpoint.session_id,
+            started,
+            ended: None,
+            observed_elapsed: proof.checkpoint.elapsed_ms,
+            index_only_log: Some(log),
+            _audio: vec![],
+            _journals: vec![],
+            _retained: vec![],
+            _capture: owner,
+        }));
     }
     let mut audio = Vec::new();
     let mut journals = Vec::new();
@@ -280,6 +424,7 @@ pub(crate) fn prepare(dir: &Path, stop: &AtomicBool) -> io::Result<Option<Stoppe
         started,
         ended: Some(ended),
         observed_elapsed: proof.checkpoint.elapsed_ms,
+        index_only_log: None,
         _capture: owner,
         _audio: audio,
         _journals: journals,
