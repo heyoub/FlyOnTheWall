@@ -52,6 +52,6 @@ Implemented on a private branch based on current upstream main. Release executab
 
 ## Integration
 
-`integration/batch-2` is an older test tree. It includes the enrichment-retry change as it stood before review and is superseded; a rebuilt tree without the rejected work is in preparation. Integration trees are test trees and are never proposed as-is.
+`integration/batch-3` combines the five proposed changes and the three recovery commits on current upstream main to test them together: full project CI passed locally on its head (2,628 passed, 0 failed, 7 ignored). Five of the six merges applied without conflict; the recovery merge had one conflict in the session pump, where both the per-source loss counts and the capture lease are kept. It contains none of the parked work above. `integration/batch-2` is the older tree that still includes the rejected enrichment retry; it is kept for history only. Integration trees are test trees and are never proposed as-is.
 
 Statuses here are updated as work is verified.
