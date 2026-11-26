@@ -15,7 +15,7 @@ This branch indexes work on this fork for nolanmak/FlyOnTheWall. `main` on this 
 
 ## Proposed upstream, awaiting review
 
-Each passed the full project CI locally on its exact commit (Linux; `just ci`, with incremental compilation and debug info turned off) and was independently reviewed before it was proposed. On the hosted checks every test job passes on Linux and macOS; the one failing job on each is the dependency advisory check, which fails the same way on upstream for RUSTSEC-2026-0592 and is addressed by upstream's own [#312](https://github.com/nolanmak/FlyOnTheWall/pull/312).
+Each passed the full project CI locally on its exact commit (Linux; `just ci`, with incremental compilation and debug info turned off) and was independently reviewed before it was proposed. On the hosted checks every test job passes on Linux and macOS; the one failing job on the first five is the dependency advisory check for RUSTSEC-2026-0592, which upstream's [#312](https://github.com/nolanmak/FlyOnTheWall/pull/312) has since fixed; it clears on a re-run or on merge.
 
 | Pull request | Branch | What it changes | Local verification | Known limits |
 | --- | --- | --- | --- | --- |
@@ -25,14 +25,16 @@ Each passed the full project CI locally on its exact commit (Linux; `just ci`, w
 | [#318](https://github.com/nolanmak/FlyOnTheWall/pull/318) | `fix/export-path-collision` | Meetings whose short export filenames collide get distinct paths by using a full-ID filename for the collision. | 2,580 passed, 0 failed, 7 ignored. | none known |
 | [#320](https://github.com/nolanmak/FlyOnTheWall/pull/320) | `fix/local-source-final-end` | The source worker re-reads the final audio boundary after input closes, so it transcribes through the last sample before completing. | 2,574 passed, 0 failed, 7 ignored. The regression test failed 50 of 50 runs on the unfixed worker and passed 50 of 50 with the change. | The same re-read on the cloud path is established by reading, not by a test. |
 
-Related issues filed: [#315](https://github.com/nolanmak/FlyOnTheWall/issues/315), [#316](https://github.com/nolanmak/FlyOnTheWall/issues/316), [#319](https://github.com/nolanmak/FlyOnTheWall/issues/319).
+| [#324](https://github.com/nolanmak/FlyOnTheWall/pull/324) | `fix/playback-rows-before-retirement` | Validates a promoted recording's archive and commits both playback rows in one transaction before the session folder is retired. | 2,576 passed, 0 failed, 7 ignored. | none known |
+| [#325](https://github.com/nolanmak/FlyOnTheWall/pull/325) | `fix/capture-lease-through-live-save` | Holds the capture lease until the live save completes and refuses a live save that would overwrite an existing meeting for the same capture. | 2,574 passed, 0 failed, 7 ignored (alone on main). | The dashboard can still say Saved after such a conflict (existing behaviour). |
+
+Related issues filed: [#315](https://github.com/nolanmak/FlyOnTheWall/issues/315), [#316](https://github.com/nolanmak/FlyOnTheWall/issues/316), [#319](https://github.com/nolanmak/FlyOnTheWall/issues/319), [#323](https://github.com/nolanmak/FlyOnTheWall/issues/323).
 
 ## Verified, not yet proposed
 
 | Branch | What it changes | Verification | Known limits |
 | --- | --- | --- | --- |
-| `wip/recovery-rows-and-lease` | Two commits: validate and write playback rows before a session folder is archived; hold the capture lease until the live save completes and, when a meeting already exists for the session, report it and keep the source. | Full project CI passed locally on both commits (2,576 and 2,578 passed, 0 failed, 7 ignored); independently reviewed. | The dashboard can still say Saved after such a collision (inherited). |
-| `wip/recover-stopped-recordings` | The two commits above plus a third: at start-up, list a recording that was stopped but never saved as an interrupted meeting, keeping its audio and transcript log in place. Adds nothing that deletes or overwrites user content. | Full project CI passed locally on each of the three commits (third: 2,592 passed, 0 failed, 7 ignored); independently reviewed twice. | The third commit changes what the library shows (a session upstream leaves invisible is listed as interrupted), so it waits for the maintainer's view. Background archiving of such recordings, a finish-status report and a quit command were deliberately left out; a recording listed this way keeps its raw session folder until archived by existing means. |
+| `wip/recover-stopped-recordings` | The two fixes in #324 and #325 plus a third: at start-up, list a recording that was stopped but never saved as an interrupted meeting, keeping its audio and transcript log in place. Adds nothing that deletes or overwrites user content. | Full project CI passed locally on each of the three commits (third: 2,592 passed, 0 failed, 7 ignored); independently reviewed twice. | The third commit changes what the library shows (a session upstream leaves invisible is listed as interrupted), so it waits for the maintainer's view. Background archiving of such recordings, a finish-status report and a quit command were deliberately left out; a recording listed this way keeps its raw session folder until archived by existing means. |
 
 ## Parked: waiting for a maintainer decision
 
