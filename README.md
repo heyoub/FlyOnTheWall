@@ -36,24 +36,29 @@ Related issues filed: [#315](https://github.com/nolanmak/FlyOnTheWall/issues/315
 | --- | --- | --- | --- |
 | `wip/recover-stopped-recordings` | The two fixes in #324 and #325 plus a third: at start-up, list a recording that was stopped but never saved as an interrupted meeting, keeping its audio and transcript log in place. Adds nothing that deletes or overwrites user content. | Full project CI passed locally on each of the three commits (third: 2,592 passed, 0 failed, 7 ignored); independently reviewed twice. | The third commit changes what the library shows (a session upstream leaves invisible is listed as interrupted), so it waits for the maintainer's view. Background archiving of such recordings, a finish-status report and a quit command were deliberately left out; a recording listed this way keeps its raw session folder until archived by existing means. |
 
-## Parked: waiting for a maintainer decision
+## Agreed with the maintainer, in progress
 
-These were implemented at least once, returned by review with failing tests, and are not being patched further because each needs a decision about what the product promises.
+The maintainer has agreed the direction for each of these and set the order: the remaining correctness fixes and developer-experience fixes first, then the interrupted-recordings change, then title and summary provenance, then Windows.
 
 | Topic | Where it stands |
 | --- | --- |
-| No meeting for an empty failed start (#271) | Two designs were rejected in review. A recommendation is with the maintainer on the issue: keep the meeting, and exclude confirmed-empty recordings from automatic processing. |
-| Imported-title sweep and explicit enrichment retry (part of #96) | Both depend on knowing who chose a title. Comparing title text cannot establish that. The proposal is to record a title's origin and whether it may be replaced. `wip/enrichment-retry` is the rejected attempt, kept for reference: do not use as-is. |
-| Summary provenance | Proposal in preparation: record which template, template digest and execution mode produced a summary. |
-| Ownership of files in the local OKF export folder | A renamed meeting leaves its old file behind. Removing stale files safely needs a record of which files the exporter wrote; proposal in preparation. |
-| Background archiving of recovered recordings | Left out of the recovery work on purpose; needs agreed prerequisites first. |
+| Interrupted recordings at start-up | Agreed. The third commit on `wip/recover-stopped-recordings` is proposed after #324 and #325 land. |
+| Title origin and replacement permission | Agreed: record where a title came from and whether it may be replaced, instead of inferring it from text. It ships in one schema change together with summary provenance, so library archives change format once. Specification in preparation against current main. The imported-title sweep and an explicit enrichment retry (part of #96) are rebuilt on it afterwards; `wip/enrichment-retry` is the rejected attempt, kept for reference only. |
+| Summary provenance | Agreed: record which template, template revision and execution mode produced each summary. Same schema change as above. |
+| Empty recordings (#271) | Agreed: keep the meeting so late notes have a place to go, and exclude confirmed-empty recordings from automatic processing. |
+| Background archiving of recovered recordings | Agreed, after the interrupted-recordings change. |
+| Ownership of files in the local OKF export folder | Agreed in principle (a manifest of files the exporter wrote), deferred for now. |
+
+## Fixed upstream
+
+Three summary defects found here were reproduced by the maintainer and fixed upstream as part of the attendee-release work: [#336](https://github.com/nolanmak/FlyOnTheWall/issues/336) (a summary could include another meeting's segments; fixed by #338 and enforced in the schema by #349), [#334](https://github.com/nolanmak/FlyOnTheWall/issues/334) (blank engine output saved as a summary; #337) and [#335](https://github.com/nolanmak/FlyOnTheWall/issues/335) (an older failed pass overwrote a newer success; #339).
 
 ## Native Windows support
 
-Implemented on a private branch based on current upstream main. Release executables build; the scripted application journey (launcher readiness, handover, stale-state recovery, search, export, stub summary) passes; a matched comparison against upstream on the same machine found no regressions. Not yet published: it is waiting for hands-on capture checks on real hardware (two-leg capture, stop and retirement, forced-termination recovery).
+Agreed with the maintainer; the pull-request order is being settled before anything is opened. Implemented on a private branch, to be re-cut from current upstream main. Release executables build; the scripted application journey (launcher readiness, handover, stale-state recovery, search, export, stub summary) passes; a matched comparison against upstream on the same machine found no regressions. Not yet published: it is waiting for hands-on capture checks on real hardware (two-leg capture, stop and retirement, forced-termination recovery).
 
 ## Integration
 
-`integration/batch-3` combines the five proposed changes and the three recovery commits on current upstream main to test them together: full project CI passed locally on its head (2,628 passed, 0 failed, 7 ignored). Five of the six merges applied without conflict; the recovery merge had one conflict in the session pump, where both the per-source loss counts and the capture lease are kept. It contains none of the parked work above. `integration/batch-2` is the older tree that still includes the rejected enrichment retry; it is kept for history only. Integration trees are test trees and are never proposed as-is.
+`integration/batch-3` combines the five proposed changes and the three recovery commits on upstream main as of `b125ed8` to test them together: full project CI passed locally on its head (2,628 passed, 0 failed, 7 ignored). Five of the six merges applied without conflict; the recovery merge had one conflict in the session pump, where both the per-source loss counts and the capture lease are kept. It contains none of the parked work above. `integration/batch-2` is the older tree that still includes the rejected enrichment retry; it is kept for history only. Integration trees are test trees and are never proposed as-is.
 
 Statuses here are updated as work is verified.
